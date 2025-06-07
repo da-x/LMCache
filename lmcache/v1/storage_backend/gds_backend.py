@@ -141,9 +141,41 @@ def load_gds_cufile(
 ) -> int:
     # Read data from disk into a GPU buffer
     with cufile.CuFile(file_path, "r") as f:
-        return f.read(
-            gpu_pointer, size_in_bytes, file_offset=file_offset, dev_offset=dev_offset
-        )
+        # Read data from disk into a GPU buffer
+        max_segment = 0x800000
+
+        # Why max_segment - turns out when giving too large of a chunk to read,
+        # cuFileRead would: 1) spawn threads 2) probe /proc/<pid>/fd to find
+        # the path of the FD 3) re-open the file in those sub threads to do
+        # reads in parallel 4) leak the file descriptors when it is done. An
+        # anti-optimization that is not needed here because we are already a
+        # multithreaded processes doing reads in parallel.
+
+        total_read = 0
+        remaining = size_in_bytes
+        while remaining > 0:
+            if remaining > max_segment:
+                read_size = max_segment
+            else:
+                read_size = remaining
+
+            read_res = f.read(
+                gpu_pointer,
+                read_size,
+                file_offset=file_offset,
+                dev_offset=dev_offset,
+            )
+            if read_res > 0:
+                total_read += read_res
+
+            if read_res != read_size:
+                return total_read
+
+            file_offset += read_size
+            dev_offset += read_size
+            remaining -= read_size
+
+        return total_read
 
 
 class GdsBackend(StorageBackendInterface):
