@@ -36,8 +36,11 @@ from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annot
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+from concurrent.futures import ThreadPoolExecutor
 
 logger = init_logger(__name__)
+
+copy_pool = ThreadPoolExecutor(max_workers=64)
 
 _METADATA_FILE_SUFFIX = ".metadata"
 _DATA_FILE_SUFFIX = ".gds1"
@@ -437,7 +440,7 @@ class GdsBackend(StorageBackendInterface):
         dtype: torch.dtype,
         shape: torch.Size,
     ) -> Optional[MemoryObj]:
-        return self._load_bytes_from_disk(key, path, dtype, shape)
+        return await self._load_bytes_from_disk(key, path, dtype, shape)
 
     def get_blocking(
         self,
@@ -453,9 +456,12 @@ class GdsBackend(StorageBackendInterface):
         shape = entry.shape
         assert dtype is not None
         assert shape is not None
-        return self._load_bytes_from_disk(key, path, dtype=dtype, shape=shape)
 
-    def _load_bytes_from_disk(
+        future = asyncio.run_coroutine_threadsafe(
+            self._load_bytes_from_disk(key, path, dtype=dtype, shape=shape), self.loop)
+        return future.result()
+
+    async def _load_bytes_from_disk(
         self,
         key: CacheEngineKey,
         path: str,
@@ -480,7 +486,9 @@ class GdsBackend(StorageBackendInterface):
         else:
             addr = ctypes.c_void_p(self.cufile_base_pointer)
             dev_offset = memory_obj.metadata.address
-        ret = load_gds_cufile(path, offset, addr, memory_obj.get_size(), dev_offset)
+
+        ret = await self.loop.run_in_executor(copy_pool,
+                load_gds_cufile, path, offset, addr, memory_obj.get_size(), dev_offset)
         if ret != memory_obj.get_size():
             if ret < 0:
                 logger.error(
