@@ -140,7 +140,7 @@ def load_gds_cufile(
     dev_offset: int,
 ) -> int:
     # Read data from disk into a GPU buffer
-    with cufile.CuFile(file_path, "r") as f:
+    with cufile.CuFile(file_path, "r", use_direct_io=True) as f:
         # Read data from disk into a GPU buffer
         max_segment = 0x800000
 
