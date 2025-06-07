@@ -515,7 +515,7 @@ class GdsBackend(StorageBackendInterface):
         dev_offset: int,
     ) -> int:
         # Read data from disk into a GPU buffer
-        with self.cufile.CuFile(gds_path, "r") as f:
+        with self.cufile.CuFile(gds_path, "r", use_direct_io=True) as f:
             return f.read(
                 gpu_pointer,
                 size_in_bytes,
