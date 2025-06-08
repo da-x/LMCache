@@ -17,6 +17,7 @@ from typing import Dict, Generator, List, Optional, Union
 import asyncio
 import multiprocessing
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Third Party
 import torch
@@ -57,6 +58,14 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+THREAD_POOL = None
+
+def get_thread_pool():
+    global THREAD_POOL
+    if not THREAD_POOL:
+        THREAD_POOL = ThreadPoolExecutor(max_workers=128)
+    return THREAD_POOL
 
 
 class CacheEngineEndSignal:
@@ -326,12 +335,17 @@ class LMCacheEngine:
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
-        for start, end, key in self.token_database.process_tokens(tokens, mask):
+
+        futures = []
+        token_processing = list(self.token_database.process_tokens(tokens, mask))
+        for start, end, key in token_processing:
             assert isinstance(key, CacheEngineKey)
 
             # Get the memory object from the storage backend
-            memory_obj = self.storage_manager.get(key)
+            futures.append(get_thread_pool().submit(self.storage_manager.get, key))
 
+        results = [f.result() for f in futures]
+        for (start, end, key), memory_obj in zip(token_processing, results):
             if memory_obj is None:
                 if self.enable_p2p:
                     future_memory_obj = asyncio.run_coroutine_threadsafe(
