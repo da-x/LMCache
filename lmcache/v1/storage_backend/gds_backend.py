@@ -26,6 +26,8 @@ import string
 import struct
 import threading
 import time
+import numpy as np
+import mmap
 
 # Third Party
 import aiofile
@@ -176,10 +178,6 @@ class GdsBackend(StorageBackendInterface):
         # HACK(Jiayi): cufile import is buggy on some hardware
         # (e.g., without GPUDirect), so it's temporarily put here.
         # Third Party
-        import cufile
-
-        self.cufile = cufile
-
         assert dst_device.startswith("cuda")
         super().__init__(dst_device)
 
@@ -198,6 +196,30 @@ class GdsBackend(StorageBackendInterface):
             f"GDS backend using fstype '{self.fstype}' on path '{self.gds_path}'"
         )
 
+        self.use_cufile = True
+        if config.extra_config is not None:
+            if config.extra_config.get('no_cufile', False):
+                self.use_cufile = False
+
+        if self.fstype in ['tmpfs', 'overlayfs']:
+            # TODO: We can replace the auto-defection of unsupported cufile
+            # file systems by doing a small cufile API test on them.
+            logger.info("Automatic disabling of cufile usage due to fstype")
+            self.use_cufile = False
+
+        self.libc = None
+        self.cudart = None
+        if not self.use_cufile:
+            logger.info("Not using cufile")
+            self.cufile = None
+            self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            self.cudart = ctypes.CDLL("libcudart.so")
+        else:
+            logger.info("Using cufile")
+            import cufile
+            self.cufile = cufile
+            self._cufile_driver = self.cufile.CuFileDriver()
+
         if not os.path.exists(self.gds_path):
             os.makedirs(self.gds_path, exist_ok=True)
 
@@ -212,7 +234,6 @@ class GdsBackend(StorageBackendInterface):
 
         self.rand = random.Random(self.dst_device)
 
-        self._cufile_driver = self.cufile.CuFileDriver()
         if hasattr(self.memory_allocator, "base_pointer"):
             logger.debug(f"Using base pointer {self.memory_allocator.base_pointer}")
             self.cufile_base_pointer = self.memory_allocator.base_pointer
@@ -380,7 +401,7 @@ class GdsBackend(StorageBackendInterface):
             self.metadata_dirs.add(subdir_key)
         tmp = ".tmp" + rand_suffix(self.rand, 8)
         metadata = await asyncio.to_thread(
-            self._save_gds_cufile,
+            self._save_gds,
             path,
             tmp,
             kv_chunk,
@@ -475,7 +496,7 @@ class GdsBackend(StorageBackendInterface):
         else:
             addr = ctypes.c_void_p(self.cufile_base_pointer)
             dev_offset = memory_obj.metadata.address
-        ret = self._load_gds_cufile(
+        ret = self._load_gds(
             path, offset, addr, memory_obj.get_size(), dev_offset
         )
         if ret != memory_obj.get_size():
@@ -505,7 +526,7 @@ class GdsBackend(StorageBackendInterface):
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def _save_gds_cufile(
+    def _save_gds(
         self,
         path: str,
         tmp: str,
@@ -527,17 +548,38 @@ class GdsBackend(StorageBackendInterface):
         try:
             with open(tmp_path, "wb") as f:
                 f.write(metadata)
-            with self.cufile.CuFile(tmp_path, "r+") as f:
-                f.write(
-                    addr, kv_chunk.nbytes, file_offset=offset, dev_offset=dev_offset
-                )
+            if self.cufile:
+                with self.cufile.CuFile(tmp_path, "r+") as f:
+                    f.write(
+                        addr, kv_chunk.nbytes, file_offset=offset, dev_offset=dev_offset
+                    )
+            else:
+                # mmap the file
+                fd = os.open(tmp_path, os.O_RDWR)
+                nbytes = kv_chunk.nbytes
+                os.ftruncate(fd, nbytes + offset)
+                mm = mmap.mmap(fd, nbytes + offset, prot=mmap.PROT_WRITE, flags=mmap.MAP_SHARED)
+                os.close(fd)
+
+                # get mapped file address
+                arr = np.frombuffer(mm, dtype=np.uint8)
+                buf_addr = arr.__array_interface__['data'][0]
+
+                res = self.cudart.cudaMemcpy(ctypes.c_void_p(buf_addr + offset),
+                                             ctypes.c_void_p(addr.value + device_offset),
+                                             ctypes.c_size_t(nbytes),
+                                             ctypes.c_int(2))
+                if res: raise RuntimeError(f"cudaMemcpy failed {res}")
+                del arr
+                mm.close()
+
         except Exception as e:
             logger.error(f"Error saving {tmp_path}: {e}", exc_info=True)
             raise e
         os.rename(tmp_path, path)
         return metadata
 
-    def _load_gds_cufile(
+    def _load_gds(
         self,
         gds_path: str,
         file_offset: int,
@@ -546,13 +588,42 @@ class GdsBackend(StorageBackendInterface):
         dev_offset: int,
     ) -> int:
         # Read data from disk into a GPU buffer
-        with self.cufile.CuFile(gds_path, "r") as f:
-            return f.read(
-                gpu_pointer,
-                size_in_bytes,
-                file_offset=file_offset,
-                dev_offset=dev_offset,
-            )
+        if self.cufile:
+            with self.cufile.CuFile(gds_path, "r") as f:
+                return f.read(
+                    gpu_pointer,
+                    size_in_bytes,
+                    file_offset=file_offset,
+                    dev_offset=dev_offset,
+                )
+        else:
+            import mmap
+            fd = os.open(gds_path, os.O_RDONLY)
+            file_size = os.fstat(fd).st_size
+            mm = mmap.mmap(fd, file_size, prot=mmap.PROT_READ, flags=mmap.MAP_PRIVATE)
+            os.close(fd)
+
+            # Use madvise to make sure the file is fully read and mapped
+            MADV_WILLNEED = 3
+            arr = np.frombuffer(mm, dtype=np.uint8)
+            addr = arr.__array_interface__['data'][0]
+            res = self.libc.madvise(ctypes.c_void_p(addr),
+                                    ctypes.c_size_t(file_size),
+                                    ctypes.c_int(MADV_WILLNEED))
+            if res != 0:
+                err = ctypes.get_errno()
+                raise OSError(err, "madvise failed")
+
+            res = self.cudart.cudaMemcpy(
+                ctypes.c_void_p(gpu_pointer.value + dev_offset),
+                ctypes.c_void_p(addr + file_offset),
+                ctypes.c_size_t(size_in_bytes),
+                ctypes.c_int(1))
+
+            if res != 0:
+                raise RuntimeError(f"cudaMemcpy failed with code {res}")
+            mm.close()
+            return size_in_bytes
 
     def pin(self, key: CacheEngineKey) -> bool:
         # TODO: Implement this
